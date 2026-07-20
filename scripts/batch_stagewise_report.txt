@@ -1,0 +1,12 @@
+Batch stagewise report — generated 2026-07-20T16:07:45.935196
+Provider: groq | Similarity mode: both
+
+##############################################################################
+#  Tim Grindland — Wabtec Controllership
+##############################################################################
+
+── STAGE 1: PARSE ──
+Resume: 6432 chars parsed from TimGrindlandresume.pdf
+JD:     9063 chars parsed from TimGrindlandJD.pdf
+
+── STAGE 2: EXTRACT ──
