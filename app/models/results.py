@@ -150,6 +150,17 @@ class CandidateSummary(BaseModel):
     recommendation: str = Field(
         description="One paragraph: overall fit assessment and recommendation."
     )
+    agency_notes: str = Field(
+        default="",
+        description=(
+            "Detailed, submission-ready explanation of fit — 5-8 sentences, each "
+            "explicitly matching a SPECIFIC JD requirement to SPECIFIC resume "
+            "evidence (e.g. 'JD requires X; candidate demonstrated this by doing Y "
+            "at Company Z'). Written in professional agency-notes style, reusable "
+            "verbatim by another system/microservice as submission notes — not "
+            "just a summary for internal scoring review."
+        ),
+    )
 
 
 # ── Stage 7: Knowledge Brief output ──────────────────────────────────────────────
@@ -216,6 +227,53 @@ class KnowledgeBrief(BaseModel):
     location: Optional[str] = None
 
 
+class ResumeFullDetail(BaseModel):
+    """
+    Everything about ONE resume, for the GET /resumes/{resume_id} endpoint.
+    This is the single response shape a frontend needs to render a full
+    candidate detail view — no follow-up calls required.
+    """
+    resume_id: str
+    session_id: str
+    candidate_name: Optional[str] = None
+    company: Optional[str] = None
+    job_title: Optional[str] = None
+
+    # Stage 3
+    passed_filter: bool
+    reject_reasons: list[str] = Field(default_factory=list)
+    rejection_summary: Optional[str] = None
+    is_close_miss: Optional[bool] = None
+
+    # Stage 4 — both raw scorer outputs, kept separate for transparency
+    semantic_scores: dict[str, float] = Field(default_factory=dict)
+    llm_scores: dict[str, float] = Field(default_factory=dict)
+
+    # Stage 5 — final blended result
+    rank: Optional[int] = None
+    overall_score: Optional[float] = None
+    final_section_scores: dict[str, float] = Field(default_factory=dict)
+    weights_used: dict = Field(default_factory=dict)  # raw weights.json structure, not flattened
+
+    # Stage 6
+    strengths: list[str] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    recommendation: Optional[str] = None
+    agency_notes: Optional[str] = Field(
+        default=None,
+        description="Detailed, submission-ready JD-matching notes — see CandidateSummary.agency_notes.",
+    )
+
+    # Stage 7
+    knowledge_brief: Optional[KnowledgeBrief] = None
+
+    # Raw material, for a recruiter who wants to see the source
+    resume_structured_data: dict = Field(default_factory=dict)
+    resume_raw_text: Optional[str] = None
+
+    created_at: Optional[str] = None
+
+
 # ── Final pipeline output ───────────────────────────────────────────────────────
 
 class PipelineResult(BaseModel):
@@ -239,4 +297,9 @@ class PipelineResult(BaseModel):
 
     similarity_mode: str = Field(
         description="'semantic' | 'llm' | 'both' — which Stage 4 path(s) were used"
+    )
+
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Set when persistence succeeded — fetch this session again via /sessions/{session_id}/candidates.",
     )

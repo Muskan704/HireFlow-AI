@@ -23,6 +23,17 @@ class _LLMSummary(BaseModel):
     strengths: list[str] = Field(min_length=1, max_length=5)
     gaps: list[str] = Field(default_factory=list, max_length=4)
     recommendation: str
+    agency_notes: str = Field(
+        description=(
+            "5-8 sentences. Each sentence explicitly matches ONE specific JD "
+            "requirement to ONE specific piece of resume evidence — e.g. "
+            "'The JD requires experience with month-end close; the candidate "
+            "performed month-end close and GL reconciliations at Beacon "
+            "Communities for 22 months.' Written in professional third-person "
+            "agency-notes style, ready to be pasted directly into a client "
+            "submission. Cover the most important JD requirements first."
+        )
+    )
 
 
 SUMMARY_SYSTEM_PROMPT = """
@@ -45,6 +56,13 @@ Rules — follow these exactly:
    should read as a cautious one. Reference the score's implication in
    plain language, not the raw number itself.
 5. Never mention information that isn't in the provided resume/JD facts.
+6. agency_notes is the most detailed field — it must go requirement by
+   requirement through the JD's must-have skills, key responsibilities, and
+   nice-to-have skills, explicitly stating whether and how the resume
+   demonstrates each one. This is written for reuse as an actual client
+   submission note, not internal review — write it in that register:
+   factual, specific, professional third person (e.g. "The candidate has
+   direct experience with X, demonstrated by Y"), not casual or hedging.
 """
 
 
@@ -111,6 +129,7 @@ def summarise_candidate(
     summary = CandidateSummary(
         resume_id=resume.resume_id, candidate_name=resume.candidate_name,
         strengths=raw.strengths, gaps=raw.gaps, recommendation=raw.recommendation,
+        agency_notes=raw.agency_notes,
     )
     logger.info(f"✓ Summarised {resume.candidate_name!r}: {len(raw.strengths)} strengths, {len(raw.gaps)} gaps")
     return summary
@@ -153,32 +172,41 @@ class _LLMRejectionSummary(BaseModel):
     )
     summary: str = Field(
         description=(
-            "2-3 sentences for a recruiter: state plainly why this candidate was "
-            "rejected (reference the SPECIFIC missing requirement(s)), then note "
-            "what relevant strengths they DO have despite the rejection, if any. "
-            "If is_close_miss is True, say so explicitly and suggest it may be "
-            "worth a manual look."
+            "4-6 sentences, detailed agency-notes style, reusable verbatim as a "
+            "'why not submitted' note: (1) state the SPECIFIC missing "
+            "requirement(s) by name, (2) go through what relevant skills/"
+            "experience the candidate DOES have, matching each to a specific "
+            "JD point where possible, (3) if is_close_miss is True, explicitly "
+            "say this is a borderline case worth a manual second look and why. "
+            "Written in professional third person, not casual — this should "
+            "read like a real recruiter's note, not an internal error message."
         )
     )
 
 
 REJECTION_SUMMARY_SYSTEM_PROMPT = """
-You are writing a short note for a recruiter explaining why a candidate was
+You are writing a detailed note for a recruiter (and potentially for reuse
+as an agency note by another system) explaining why a candidate was
 automatically rejected by an exact-match hard filter, and whether the
 rejection might be worth double-checking manually.
 
 Rules:
-1. State the SPECIFIC missing requirement(s) — never a vague "doesn't meet
-   requirements."
-2. If the candidate clearly has strong, directly relevant experience/skills
-   despite the technical rejection, say so — a hard filter rejects on exact
-   text matching and can be wrong (e.g. a candidate may have equivalent
-   experience phrased differently, or be missing something genuinely minor).
+1. State the SPECIFIC missing requirement(s) by name — never a vague
+   "doesn't meet requirements."
+2. Go through the candidate's relevant skills/experience even though they
+   were rejected — explicitly connect what they DO have to specific JD
+   points, the same way you would for a candidate who passed. A hard
+   filter rejects on exact text matching and can be wrong (e.g. equivalent
+   experience phrased differently, or missing something genuinely minor) —
+   this note should give a recruiter enough detail to judge that for
+   themselves, not just a bare rejection reason.
 3. Set is_close_miss=True ONLY when the gap is small (1-2 missing items, and
    the candidate is otherwise a strong, clear match) — not for every
    rejection. Most rejections are NOT close misses; be honest and
    conservative here, don't inflate this to be reassuring.
 4. Never invent facts not present in the resume or JD provided.
+5. Write in professional, factual, third-person register — this is a real
+   business document, not a casual note.
 """
 
 

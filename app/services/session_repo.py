@@ -40,6 +40,7 @@ from app.models.results import (
     RankedCandidate,
     CandidateSummary,
     KnowledgeBrief,
+    ResumeFullDetail,
 )
 
 
@@ -78,6 +79,8 @@ def save_full_session(
         session_record = Session(
             id=session_id,
             agency_id=agency_id,
+            company=jd.company,
+            job_title=jd.job_title,
             status="processing",
             weights_used=weights_used,
         )
@@ -164,6 +167,7 @@ def save_full_session(
                 strengths=summary.strengths,
                 gaps=summary.gaps,
                 recommendation=summary.recommendation,
+                agency_notes=summary.agency_notes,
             ))
 
         # 8. Knowledge briefs (top-N candidates only, per pipeline.py)
@@ -269,3 +273,162 @@ def get_session_detail(session_id: str) -> dict:
             "summaries": summaries,
             "knowledge_briefs": briefs,
         }
+
+
+# ── Task-2 query functions: company/JD-scoped access for the API layer ──────────
+
+def list_sessions_by_company(company: str, limit: int = 50) -> list[dict]:
+    """
+    'All JD postings (sessions) for Company X.' Case-insensitive substring
+    match on the company name, since real-world company names in JDs won't
+    always be typed identically ('Novo Nordisk' vs 'novo nordisk inc.').
+    """
+    with get_db_session() as db:
+        query = (
+            select(Session)
+            .where(Session.company.ilike(f"%{company}%"))
+            .order_by(Session.created_at.desc())
+            .limit(limit)
+        )
+        sessions = db.exec(query).all()
+
+        results = []
+        for s in sessions:
+            ranked_count = len(db.exec(
+                select(RankedCandidateRecord).where(RankedCandidateRecord.session_id == s.id)
+            ).all())
+            total_resumes = len(db.exec(
+                select(ResumeRecord).where(ResumeRecord.session_id == s.id)
+            ).all())
+            results.append({
+                "session_id": s.id,
+                "company": s.company,
+                "job_title": s.job_title,
+                "created_at": s.created_at,
+                "status": s.status,
+                "total_resumes": total_resumes,
+                "candidates_ranked": ranked_count,
+            })
+        return results
+
+
+def list_resumes_for_session(session_id: str, passed_only: bool = True) -> list[RankedCandidate]:
+    """
+    The core 'task 2' endpoint data: every resume submitted against ONE
+    company's JD, sorted best-to-worst by overall_score — exactly the
+    priority-ordered list a recruiter needs for '1 JD vs 100 resumes.'
+
+    passed_only=True (default): only candidates who cleared Stage 3 and
+    got ranked — this is what you want for the main candidate list view.
+    passed_only=False: also returns rejected candidates appended after the
+    ranked ones (rank=None), useful for a 'show me everyone, including
+    rejects' admin view.
+    """
+    with get_db_session() as db:
+        ranked_records = db.exec(
+            select(RankedCandidateRecord)
+            .where(RankedCandidateRecord.session_id == session_id)
+            .order_by(RankedCandidateRecord.rank)
+        ).all()
+
+        resume_names = {
+            r.id: r.candidate_name
+            for r in db.exec(
+                select(ResumeRecord).where(ResumeRecord.session_id == session_id)
+            ).all()
+        }
+
+        results = [
+            RankedCandidate(
+                rank=r.rank,
+                resume_id=r.resume_id,
+                candidate_name=resume_names.get(r.resume_id),
+                overall_score=r.overall_score,
+                section_scores=r.score_breakdown,
+            )
+            for r in ranked_records
+        ]
+
+        if not passed_only:
+            rejected = db.exec(
+                select(FilterResultRecord)
+                .where(FilterResultRecord.session_id == session_id)
+                .where(FilterResultRecord.passed == False)  # noqa: E712
+            ).all()
+            for fr in rejected:
+                results.append(
+                    RankedCandidate(
+                        rank=0,  # 0 = "not ranked, was rejected" — frontend should treat 0 specially
+                        resume_id=fr.resume_id,
+                        candidate_name=resume_names.get(fr.resume_id),
+                        overall_score=0.0,
+                        section_scores={},
+                    )
+                )
+
+        return results
+
+
+def get_resume_detail(resume_id: str) -> ResumeFullDetail:
+    """
+    Everything about ONE resume — the single response the
+    GET /resumes/{resume_id} endpoint returns. Joins across every table
+    so the frontend gets one complete object, no follow-up calls needed.
+    """
+    with get_db_session() as db:
+        resume_record = db.get(ResumeRecord, resume_id)
+        if not resume_record:
+            raise ValueError(f"No resume found with id={resume_id}")
+
+        session_record = db.get(Session, resume_record.session_id)
+
+        filter_result = db.exec(
+            select(FilterResultRecord).where(FilterResultRecord.resume_id == resume_id)
+        ).first()
+
+        scores = db.exec(
+            select(CandidateScoreRecord).where(CandidateScoreRecord.resume_id == resume_id)
+        ).all()
+        semantic_scores = next((s.section_scores for s in scores if s.method == "semantic"), {})
+        llm_scores = next((s.section_scores for s in scores if s.method == "llm"), {})
+
+        ranked = db.exec(
+            select(RankedCandidateRecord).where(RankedCandidateRecord.resume_id == resume_id)
+        ).first()
+
+        summary = db.exec(
+            select(CandidateSummaryRecord).where(CandidateSummaryRecord.resume_id == resume_id)
+        ).first()
+
+        brief_record = db.exec(
+            select(KnowledgeBriefRecord).where(KnowledgeBriefRecord.resume_id == resume_id)
+        ).first()
+        knowledge_brief = None
+        if brief_record:
+            knowledge_brief = KnowledgeBrief(**brief_record.brief_data)
+
+        return ResumeFullDetail(
+            resume_id=resume_id,
+            session_id=resume_record.session_id,
+            candidate_name=resume_record.candidate_name,
+            company=session_record.company if session_record else None,
+            job_title=session_record.job_title if session_record else None,
+            passed_filter=filter_result.passed if filter_result else False,
+            reject_reasons=filter_result.reject_reasons if filter_result else [],
+            rejection_summary=filter_result.rejection_summary if filter_result else None,
+            is_close_miss=filter_result.is_close_miss if filter_result else None,
+            semantic_scores=semantic_scores,
+            llm_scores=llm_scores,
+            rank=ranked.rank if ranked else None,
+            overall_score=ranked.overall_score if ranked else None,
+            final_section_scores=ranked.score_breakdown if ranked else {},
+            weights_used=session_record.weights_used if session_record else {},
+            strengths=summary.strengths if summary else [],
+            gaps=summary.gaps if summary else [],
+            recommendation=summary.recommendation if summary else None,
+            agency_notes=summary.agency_notes if summary else None,
+            knowledge_brief=knowledge_brief,
+            resume_structured_data=resume_record.structured_data,
+            resume_raw_text=resume_record.raw_text,
+            created_at=resume_record.created_at.isoformat() if resume_record.created_at else None,
+        )

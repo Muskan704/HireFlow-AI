@@ -22,3 +22,10 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# SQLite databases
+*.db
+
+# Specific database files (optional)
+database.db
+app.db

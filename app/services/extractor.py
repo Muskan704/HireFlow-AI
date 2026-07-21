@@ -90,7 +90,7 @@ def extract_resume(raw_text: str) -> ResumeData:
         # observed ~43s latency (vs ~5s normal) and a suspiciously short
         # skills list on whichever retry attempt finally parsed as valid
         # JSON. 8192 gives real headroom without meaningful cost impact.
-        max_tokens=8192,
+        max_tokens=8000,
     )
 
     result.raw_text_snippet = raw_text[:300]
@@ -212,7 +212,7 @@ def extract_jd(raw_text: str) -> JDData:
         user_prompt=f"<job_description>\n{raw_text}\n</job_description>",
         response_model=JDData,
         temperature=0.1,
-        max_tokens=8192,  # same reasoning as extract_resume — long JDs can exceed the 4096 default
+        max_tokens=8000,  # Groq's hard ceiling for llama-3.3-70b-versatile is 8192 — 8000 leaves real margin
     )
 
     result.raw_text_snippet = raw_text[:300]

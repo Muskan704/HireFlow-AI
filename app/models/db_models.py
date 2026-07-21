@@ -29,10 +29,15 @@ def _uuid_str() -> str:
 
 
 class Session(SQLModel, table=True):
-    """One Pre-Call Setup run: one JD + N resumes."""
+    """One Pre-Call Setup run: one JD (for one company/role) + N resumes."""
 
     id: str = Field(default_factory=_uuid_str, primary_key=True)
     agency_id: Optional[str] = Field(default=None, index=True)
+    # Denormalized from the JD at save time, specifically so "all sessions
+    # for Company X" or "all sessions for this job title" is a direct
+    # indexed query — not a JSON field lookup inside JobDescriptionRecord.
+    company: Optional[str] = Field(default=None, index=True)
+    job_title: Optional[str] = Field(default=None, index=True)
     status: str = Field(default="processing")  # processing | complete | failed
     created_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
@@ -109,6 +114,7 @@ class CandidateSummaryRecord(SQLModel, table=True):
     strengths: list = Field(default_factory=list, sa_column=Column(JSON))
     gaps: list = Field(default_factory=list, sa_column=Column(JSON))
     recommendation: str
+    agency_notes: str = Field(default="")
     grounded_on: dict = Field(default_factory=dict, sa_column=Column(JSON))  # trace back to source fields
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
