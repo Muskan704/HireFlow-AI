@@ -8,6 +8,8 @@ Groq + Instructor for structured outputs.
 from __future__ import annotations
 
 import instructor
+import re
+import time
 from groq import Groq
 from loguru import logger
 from pydantic import BaseModel
@@ -60,19 +62,43 @@ class GroqProvider(BaseLLMProvider):
             f"response_model={response_model.__name__}"
         )
 
-        return self.client.chat.completions.create(
-            model=self.model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
-            response_model=response_model,
-        )
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                return self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt,
+                        },
+                        {
+                            "role": "user",
+                            "content": user_prompt,
+                        },
+                    ],
+                    response_model=response_model,
+                )
+            except Exception as e:
+                last_error = e
+                retry_after = _extract_retry_after_seconds(str(e))
+                if retry_after is None or attempt == 3:
+                    raise
+
+                wait_seconds = retry_after + 1.0
+                logger.warning(
+                    f"Groq rate limit hit; waiting {wait_seconds:.1f}s "
+                    f"before retry {attempt + 1}/3"
+                )
+                time.sleep(wait_seconds)
+
+        raise last_error
+
+
+def _extract_retry_after_seconds(error_message: str) -> float | None:
+    match = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", error_message, re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1))

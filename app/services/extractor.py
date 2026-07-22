@@ -82,15 +82,10 @@ def extract_resume(raw_text: str) -> ResumeData:
         user_prompt=f"<resume>\n{raw_text}\n</resume>",
         response_model=ResumeData,
         temperature=0.1,
-        # Default max_tokens=4096 was likely truncating the structured
-        # output for longer resumes — a resume with 6 jobs and ~90 skills
-        # produces a large JSON object (every skill string, every
-        # responsibility bullet, every job's fields). A truncated response
-        # forces Instructor to retry internally, which matches the
-        # observed ~43s latency (vs ~5s normal) and a suspiciously short
-        # skills list on whichever retry attempt finally parsed as valid
-        # JSON. 8192 gives real headroom without meaningful cost impact.
-        max_tokens=8000,
+        # Keep enough output room for detailed structured resumes, but avoid
+        # reserving so many tokens that Groq rejects the request before
+        # generation starts on the on-demand TPM tier.
+        max_tokens=3500,
     )
 
     result.raw_text_snippet = raw_text[:300]
@@ -212,7 +207,7 @@ def extract_jd(raw_text: str) -> JDData:
         user_prompt=f"<job_description>\n{raw_text}\n</job_description>",
         response_model=JDData,
         temperature=0.1,
-        max_tokens=8000,  # Groq's hard ceiling for llama-3.3-70b-versatile is 8192 — 8000 leaves real margin
+        max_tokens=2500,
     )
 
     result.raw_text_snippet = raw_text[:300]

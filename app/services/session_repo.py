@@ -40,8 +40,20 @@ from app.models.results import (
     RankedCandidate,
     CandidateSummary,
     KnowledgeBrief,
+    PipelineResult,
     ResumeFullDetail,
 )
+from app.core.config import get_settings
+
+
+def _flatten_public_weights(weights: dict | None) -> dict[str, float]:
+    weights = weights or {}
+    return {
+        **weights.get("skill_matching", {}),
+        **weights.get("experience_matching", {}),
+        **weights.get("additional_components", {}),
+        "blend_ratio": weights.get("blend_ratio", 0.5),
+    }
 
 
 def save_full_session(
@@ -56,6 +68,7 @@ def save_full_session(
     summaries: list[CandidateSummary],
     weights_used: dict,
     knowledge_briefs: Optional[list[KnowledgeBrief]] = None,
+    parsing_failures: Optional[list[FilterResult]] = None,
     agency_id: Optional[str] = None,
 ) -> str:
     """
@@ -116,9 +129,24 @@ def save_full_session(
                 structured_data=resume.model_dump(mode="json"),
             ))
 
+        parsing_failure_results: list[FilterResult] = []
+        for failure in (parsing_failures or []):
+            resume_id = failure.resume_id or str(uuid.uuid4())
+            parsing_failure_results.append(
+                failure.model_copy(update={"resume_id": resume_id})
+            )
+            db.add(ResumeRecord(
+                id=resume_id,
+                session_id=session_id,
+                agency_id=agency_id,
+                candidate_name=failure.candidate_name,
+                raw_text="",
+                structured_data={},
+            ))
+
         # 4. Every filter result — pass AND reject, so rejected candidates
         # are traceable with their reasons, not silently dropped.
-        for fr in filter_results:
+        for fr in filter_results + parsing_failure_results:
             if not fr.resume_id:
                 continue  # e.g. a parsing-failure entry with no resume_id
             db.add(FilterResultRecord(
@@ -275,6 +303,99 @@ def get_session_detail(session_id: str) -> dict:
         }
 
 
+def get_pipeline_result(session_id: str) -> PipelineResult:
+    """
+    Reconstruct the public PipelineResult contract from persisted stage records.
+
+    The API response stays identical to the synchronous processing endpoint;
+    this repository function hides the normalized table layout from callers.
+    """
+    settings = get_settings()
+    with get_db_session() as db:
+        session_record = db.get(Session, session_id)
+        if not session_record:
+            raise ValueError(f"No session found with id={session_id}")
+
+        jd_record = db.exec(
+            select(JobDescriptionRecord).where(JobDescriptionRecord.session_id == session_id)
+        ).first()
+
+        resume_records = db.exec(
+            select(ResumeRecord).where(ResumeRecord.session_id == session_id)
+        ).all()
+        resume_names = {r.id: r.candidate_name for r in resume_records}
+
+        filter_records = db.exec(
+            select(FilterResultRecord).where(FilterResultRecord.session_id == session_id)
+        ).all()
+
+        summary_records = db.exec(
+            select(CandidateSummaryRecord).where(CandidateSummaryRecord.session_id == session_id)
+        ).all()
+        recommendation_by_resume_id = {
+            s.resume_id: s.recommendation
+            for s in summary_records
+        }
+
+        ranked_records = db.exec(
+            select(RankedCandidateRecord)
+            .where(RankedCandidateRecord.session_id == session_id)
+            .order_by(RankedCandidateRecord.rank)
+        ).all()
+
+        brief_records = db.exec(
+            select(KnowledgeBriefRecord).where(KnowledgeBriefRecord.session_id == session_id)
+        ).all()
+
+        rejected_candidates = [
+            FilterResult(
+                resume_id=fr.resume_id,
+                candidate_name=resume_names.get(fr.resume_id),
+                passed=False,
+                reject_reasons=fr.reject_reasons,
+                rejection_summary=fr.rejection_summary,
+                is_close_miss=fr.is_close_miss,
+                checks=fr.checks,
+            )
+            for fr in filter_records
+            if not fr.passed
+        ]
+
+        flat_weights_used = _flatten_public_weights(session_record.weights_used)
+
+        ranked_candidates = [
+            RankedCandidate(
+                rank=r.rank,
+                resume_id=r.resume_id,
+                candidate_name=resume_names.get(r.resume_id),
+                overall_score=r.overall_score,
+                section_scores=r.score_breakdown,
+                weights_used=flat_weights_used,
+                fit_summary=recommendation_by_resume_id.get(r.resume_id),
+            )
+            for r in ranked_records
+        ]
+
+        knowledge_briefs = [
+            KnowledgeBrief(**brief.brief_data)
+            for brief in brief_records
+        ]
+
+        jd_data = jd_record.structured_data if jd_record else {}
+
+        return PipelineResult(
+            jd_title=jd_data.get("job_title") or session_record.job_title,
+            total_resumes_processed=len(resume_records),
+            total_passed_filter=len(ranked_candidates),
+            total_rejected=len(rejected_candidates),
+            rejected_candidates=rejected_candidates,
+            ranked_candidates=ranked_candidates,
+            knowledge_briefs=knowledge_briefs,
+            similarity_mode=settings.similarity_mode,
+            session_id=session_id,
+        )
+
+
 # ── Task-2 query functions: company/JD-scoped access for the API layer ──────────
 
 def list_sessions_by_company(company: str, limit: int = 50) -> list[dict]:
@@ -422,7 +543,9 @@ def get_resume_detail(resume_id: str) -> ResumeFullDetail:
             rank=ranked.rank if ranked else None,
             overall_score=ranked.overall_score if ranked else None,
             final_section_scores=ranked.score_breakdown if ranked else {},
-            weights_used=session_record.weights_used if session_record else {},
+            weights_used=_flatten_public_weights(
+                session_record.weights_used if session_record else {}
+            ),
             strengths=summary.strengths if summary else [],
             gaps=summary.gaps if summary else [],
             recommendation=summary.recommendation if summary else None,

@@ -32,6 +32,7 @@ Design:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from loguru import logger
@@ -46,15 +47,34 @@ from app.models.results import (
     CandidateSummary,
 )
 from app.services.parser import parse_document
+from app.services.text_cleaner import clean_document_text
 from app.services.extractor import extract_resume, extract_jd
 from app.services.hard_filter import run_hard_filter_bulk
-from app.services.scorer_semantic import score_candidates_semantic_bulk
-from app.services.scorer_llm import score_candidates_llm_bulk
+from app.services.scorer_semantic import (
+    score_candidate_semantic,
+    score_candidates_semantic_bulk,
+)
+from app.services.scorer_llm import score_candidate_llm, score_candidates_llm_bulk
 from app.services.ranker import rank_candidates, load_weights
-from app.services.summariser import summarise_candidates_bulk, summarise_rejections_bulk
-from app.services.knowledge_brief import generate_briefs_bulk
+from app.services.summariser import (
+    summarise_candidate,
+    summarise_candidates_bulk,
+    summarise_rejection,
+    summarise_rejections_bulk,
+)
+from app.services.knowledge_brief import generate_knowledge_brief, generate_briefs_bulk
 
 settings = get_settings()
+
+
+def _clean_parsed_text(raw_text: str, filename: str) -> str:
+    cleaned = clean_document_text(raw_text)
+    if len(cleaned) != len(raw_text):
+        logger.info(
+            f"Cleaned email/PDF boilerplate from {filename!r} | "
+            f"chars {len(raw_text)} -> {len(cleaned)}"
+        )
+    return cleaned
 
 
 @dataclass
@@ -107,7 +127,10 @@ def _run_pipeline_core(
     )
 
     # ── Stage 1+2: JD ────────────────────────────────────────────────────────
-    jd_raw_text = parse_document(jd_source[0], jd_source[1])
+    jd_raw_text = _clean_parsed_text(
+        parse_document(jd_source[0], jd_source[1]),
+        jd_source[1],
+    )
     if not jd_raw_text.strip():
         raise ValueError(f"Could not extract text from JD file: {jd_source[1]}")
 
@@ -125,7 +148,7 @@ def _run_pipeline_core(
 
     for raw_bytes, filename in resume_sources:
         try:
-            raw_text = parse_document(raw_bytes, filename)
+            raw_text = _clean_parsed_text(parse_document(raw_bytes, filename), filename)
             if not raw_text.strip():
                 parsing_failures.append(FilterResult(
                     candidate_name=filename, passed=False,
@@ -230,6 +253,205 @@ def _run_pipeline_core(
     )
 
 
+async def _run_llm_call(semaphore: asyncio.Semaphore, func, *args):
+    async with semaphore:
+        return await asyncio.to_thread(func, *args)
+
+
+async def _parse_and_extract_resume(
+    raw_bytes: bytes,
+    filename: str,
+    llm_semaphore: asyncio.Semaphore,
+) -> tuple[ResumeData | None, str | None, FilterResult | None]:
+    try:
+        raw_text = await asyncio.to_thread(parse_document, raw_bytes, filename)
+        raw_text = _clean_parsed_text(raw_text, filename)
+        if not raw_text.strip():
+            return None, None, FilterResult(
+                candidate_name=filename,
+                passed=False,
+                reject_reasons=["Could not extract any text from document"],
+                checks={"parsing": False},
+            )
+
+        resume = await _run_llm_call(llm_semaphore, extract_resume, raw_text)
+        return resume, raw_text, None
+    except Exception as e:
+        logger.error(f"Resume parsing/extraction failed for {filename}: {e}")
+        return None, None, FilterResult(
+            candidate_name=filename,
+            passed=False,
+            reject_reasons=[f"Extraction failed: {e}"],
+            checks={"extraction": False},
+        )
+
+
+async def _run_pipeline_core_async(
+    resume_sources: list[tuple[bytes, str]],
+    jd_source: tuple[bytes, str],
+) -> _PipelineRun:
+    """
+    Async orchestration variant of _run_pipeline_core().
+
+    It reuses the exact same stage functions and formulas, but dispatches
+    independent per-resume work through asyncio.gather()/to_thread().
+    """
+    logger.info(
+        f"Starting async pipeline run | resumes={len(resume_sources)} | "
+        f"mode={settings.similarity_mode}"
+    )
+
+    jd_raw_text = await asyncio.to_thread(parse_document, jd_source[0], jd_source[1])
+    jd_raw_text = _clean_parsed_text(jd_raw_text, jd_source[1])
+    if not jd_raw_text.strip():
+        raise ValueError(f"Could not extract text from JD file: {jd_source[1]}")
+
+    try:
+        llm_semaphore = asyncio.Semaphore(1)
+        jd = await _run_llm_call(llm_semaphore, extract_jd, jd_raw_text)
+        logger.info(f"JD extracted: title={jd.job_title!r}")
+    except Exception as e:
+        logger.exception("JD extraction failed")
+        raise ValueError(f"JD extraction failed: {e}") from e
+
+    resume_tasks = [
+        _parse_and_extract_resume(raw_bytes, filename, llm_semaphore)
+        for raw_bytes, filename in resume_sources
+    ]
+    resume_results = await asyncio.gather(*resume_tasks)
+
+    parsing_failures: list[FilterResult] = []
+    extracted_resumes: list[ResumeData] = []
+    resume_raw_texts: dict[str, str] = {}
+
+    for resume, raw_text, failure in resume_results:
+        if failure is not None:
+            parsing_failures.append(failure)
+            continue
+        if resume is not None and raw_text is not None:
+            extracted_resumes.append(resume)
+            resume_raw_texts[resume.resume_id] = raw_text
+
+    logger.info(
+        f"Resume extraction complete | success={len(extracted_resumes)} | "
+        f"failed={len(parsing_failures)}"
+    )
+
+    empty_run = _PipelineRun(
+        jd=jd, jd_raw_text=jd_raw_text,
+        extracted_resumes=extracted_resumes, resume_raw_texts=resume_raw_texts,
+        parsing_failures=parsing_failures, filter_results=[], passed_resumes=[],
+        semantic_scores=[], llm_scores=[], ranked_candidates=[], summaries=[],
+        weights_used=load_weights(), total_resumes_submitted=len(resume_sources),
+    )
+
+    if not extracted_resumes:
+        logger.warning("No resumes successfully extracted.")
+        return empty_run
+
+    passed_resumes, filter_results = await asyncio.to_thread(
+        run_hard_filter_bulk, extracted_resumes, jd
+    )
+    logger.info(
+        f"Hard filter complete | passed={len(passed_resumes)} | "
+        f"rejected={len(filter_results) - len(passed_resumes)}"
+    )
+
+    resumes_by_id = {r.resume_id: r for r in extracted_resumes}
+    rejection_tasks = [
+        _run_llm_call(
+            llm_semaphore,
+            summarise_rejection,
+            resumes_by_id[fr.resume_id],
+            jd,
+            fr.reject_reasons,
+        )
+        for fr in filter_results
+        if not fr.passed and fr.resume_id and fr.resume_id in resumes_by_id
+    ]
+    rejection_results = await asyncio.gather(*rejection_tasks)
+    rejection_iter = iter(rejection_results)
+    for fr in filter_results:
+        if not fr.passed and fr.resume_id and fr.resume_id in resumes_by_id:
+            summary, is_close_miss = next(rejection_iter)
+            fr.rejection_summary = summary
+            fr.is_close_miss = is_close_miss
+
+    if not passed_resumes:
+        logger.warning("No candidates passed the hard filter.")
+        empty_run.filter_results = filter_results
+        return empty_run
+
+    semantic_scores: list[CandidateScores] = []
+    llm_scores: list[CandidateScores] = []
+    mode = settings.similarity_mode
+
+    if mode in ("semantic", "both"):
+        semantic_scores = await asyncio.gather(*[
+            asyncio.to_thread(score_candidate_semantic, resume, jd)
+            for resume in passed_resumes
+        ])
+        logger.info(f"Semantic scoring complete for {len(semantic_scores)} candidates")
+
+    if mode in ("llm", "both"):
+        llm_scores = await asyncio.gather(*[
+            _run_llm_call(llm_semaphore, score_candidate_llm, resume, jd)
+            for resume in passed_resumes
+        ])
+        logger.info(f"LLM scoring complete for {len(llm_scores)} candidates")
+
+    ranked_candidates = rank_candidates(passed_resumes, semantic_scores, llm_scores)
+    logger.info(
+        f"Ranking complete | top="
+        f"{ranked_candidates[0].candidate_name if ranked_candidates else 'N/A'}"
+    )
+
+    passed_by_id = {r.resume_id: r for r in passed_resumes}
+    summaries = await asyncio.gather(*[
+        _run_llm_call(
+            llm_semaphore,
+            summarise_candidate,
+            passed_by_id[ranked.resume_id],
+            jd,
+            ranked,
+        )
+        for ranked in ranked_candidates
+        if ranked.resume_id in passed_by_id
+    ])
+
+    summary_by_id = {s.resume_id: s for s in summaries}
+    for ranked in ranked_candidates:
+        summary = summary_by_id.get(ranked.resume_id)
+        if summary:
+            ranked.fit_summary = summary.recommendation
+
+    logger.info(f"Summarised {len(summaries)} candidates")
+
+    knowledge_briefs = await asyncio.gather(*[
+        _run_llm_call(
+            llm_semaphore,
+            generate_knowledge_brief,
+            passed_by_id[ranked.resume_id],
+            jd,
+            ranked,
+        )
+        for ranked in ranked_candidates[:3]
+        if ranked.resume_id in passed_by_id
+    ])
+    logger.info(f"Generated {len(knowledge_briefs)} knowledge briefs (top 3)")
+
+    return _PipelineRun(
+        jd=jd, jd_raw_text=jd_raw_text,
+        extracted_resumes=extracted_resumes, resume_raw_texts=resume_raw_texts,
+        parsing_failures=parsing_failures, filter_results=filter_results,
+        passed_resumes=passed_resumes,
+        semantic_scores=semantic_scores, llm_scores=llm_scores,
+        ranked_candidates=ranked_candidates, summaries=list(summaries),
+        knowledge_briefs=list(knowledge_briefs),
+        weights_used=load_weights(), total_resumes_submitted=len(resume_sources),
+    )
+
+
 def run_pipeline(
     resume_sources: list[tuple[bytes, str]],
     jd_source: tuple[bytes, str],
@@ -282,6 +504,7 @@ def run_pipeline_with_persistence(
             ranked_candidates=run.ranked_candidates,
             summaries=run.summaries,
             knowledge_briefs=run.knowledge_briefs,
+            parsing_failures=run.parsing_failures,
             weights_used=run.weights_used,
             agency_id=agency_id,
         )
@@ -290,4 +513,43 @@ def run_pipeline_with_persistence(
         logger.error(f"Failed to persist pipeline results: {e}")
         # Persistence failure shouldn't fail the whole run — the recruiter
         # still gets their ranked candidates back, just without history.
+        return result, ""
+
+
+async def run_pipeline_with_persistence_async(
+    resume_sources: list[tuple[bytes, str]],
+    jd_source: tuple[bytes, str],
+    agency_id: str | None = None,
+) -> tuple[PipelineResult, str]:
+    """
+    Async orchestration entry point for business-facing APIs.
+    """
+    run = await _run_pipeline_core_async(resume_sources, jd_source)
+    result = run.to_pipeline_result()
+
+    if not settings.database_url:
+        logger.warning("DATABASE_URL not set - skipping persistence.")
+        return result, ""
+
+    try:
+        from app.services.session_repo import save_full_session
+        session_id = await asyncio.to_thread(
+            save_full_session,
+            jd=run.jd,
+            jd_raw_text=run.jd_raw_text,
+            resumes=run.extracted_resumes,
+            resume_raw_texts=run.resume_raw_texts,
+            filter_results=run.filter_results,
+            semantic_scores=run.semantic_scores,
+            llm_scores=run.llm_scores,
+            ranked_candidates=run.ranked_candidates,
+            summaries=run.summaries,
+            knowledge_briefs=run.knowledge_briefs,
+            parsing_failures=run.parsing_failures,
+            weights_used=run.weights_used,
+            agency_id=agency_id,
+        )
+        return result, session_id
+    except Exception as e:
+        logger.error(f"Failed to persist pipeline results: {e}")
         return result, ""
