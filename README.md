@@ -1,244 +1,1087 @@
-# Recruitment Intelligence Platform — Pre-Call Setup Module
+# Recruitment Intelligence Platform
 
-A backend-first pipeline that takes a bulk set of resumes and a single job description and produces **ranked, scored, and summarized candidate outputs** for recruiters — cutting down manual resume screening before a recruiter's first call with a candidate.
+AI-assisted resume screening service for ranking multiple candidates against a single job description.
 
-This README tracks what's built, what's still to come, and *why* each design decision was made — so the architecture stays legible as the project grows.
+The public API is intentionally business-focused: upload one JD and many resumes, receive a ranked candidate report. Internal parsing, extraction, scoring, ranking, summarisation, and knowledge brief stages are hidden behind the `/candidate-ranking` endpoint.
 
----
+## Current Public API
 
-## 1. Architecture Overview
+FastAPI app:
 
-```
-                         ┌─────────────────────┐
-                         │   Bulk Resumes (PDF/ │
-                         │   DOCX) + Job Desc   │
-                         └──────────┬──────────┘
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │ Stage 1 — Document Parsing     │  ✅ DONE
-                    │ PyMuPDF + OCR fallback / docx  │
-                    └──────────────┬─────────────────┘
-                                   ▼
-                    ┌───────────────────────────────┐
-                    │ Stage 2 — LLM Extraction       │  ✅ DONE
-                    │ Raw text → structured          │
-                    │ ResumeData / JDData             │
-                    └──────────────┬─────────────────┘
-                                   ▼
-                    ┌───────────────────────────────┐
-                    │ Skill Normalization Layer      │  ✅ DONE
-                    │ Alias table + parenthetical    │
-                    │ abbreviation extraction         │
-                    └──────────────┬─────────────────┘
-                                   ▼
-                    ┌───────────────────────────────┐
-                    │ Stage 3 — Hard Filter          │  ✅ DONE
-                    │ Deterministic knockout gate    │
-                    └──────────────┬─────────────────┘
-                          pass │        │ reject
-                               ▼        ▼
-              ┌─────────────────────┐  (recruiter sees
-              │ Stage 4A — Semantic │   rejection reason,
-              │ Scoring (embeddings)│   candidate excluded
-              └──────────┬───────────┘  from ranking)
-                        ▼
-              ┌─────────────────────┐
-              │ Stage 4B — LLM      │   ✅ DONE
-              │ Section Scoring      │
-              └──────────┬───────────┘
-                        ▼
-              ┌─────────────────────┐
-              │ Stage 5 — Ranker    │   ✅ DONE
-              │ Weighted formula     │
-              └──────────┬───────────┘
-                        ▼
-              ┌─────────────────────┐
-              │ Stage 6 — Summariser│   ✅ DONE
-              │ Recruiter-facing fit │
-              │ summary               │
-              └──────────┬───────────┘
-                        ▼
-        ┌─────────────────────────────────────┐
-        │  Pipeline Orchestration              │  ✅ DONE
-        │  pipeline.py + API endpoint          │
-        └─────────────────────────────────────┘
-                        ▼
-        ┌─────────────────────────────────────┐
-        │  DB Persistence Layer                │  🔧 DESIGNED
-        │  (db_models.py schema ready,         │   NOT WIRED
-        │   needs connection to pipeline)      │
-        └─────────────────────────────────────┘
-
-        FUTURE ENHANCEMENTS (deferred):
-        • Knowledge Brief Engine (JD summary + resume digest)
-        • Q&A Generation Engine (interview questions, red flags)
+```bash
+uvicorn app.api.main:app --reload
 ```
 
-**Design principle carried through every stage:** each stage returns a consistent, well-defined output shape so the next stage doesn't need to know *how* the previous one produced it. This is why Stage 4A (embeddings) and Stage 4B (LLM scoring) are designed to return the same `CandidateScores` shape even though their internal methods are completely different — the Ranker (Stage 5) stays agnostic to which scoring path fed it.
+Swagger UI:
 
----
+```text
+http://127.0.0.1:8000/docs
+```
 
-## 2. What's Built So Far
+Exposed endpoints:
 
-### Stage 1 — Document Parsing ✅
-Extracts raw text from uploaded resumes and job descriptions.
-- **PyMuPDF** for PDF text extraction, with an **OCR fallback** for scanned/image-based PDFs
-- **python-docx** for `.docx` files
-- **Why:** Resumes arrive in inconsistent formats (text-based PDFs, scanned PDFs, Word docs). A single parser can't handle all of them reliably, so parsing is format-aware from the start rather than assuming clean text input.
-
-### Stage 2 — LLM Extraction ✅
-Converts raw, unstructured resume/JD text into structured data.
-- **Groq (`llama-3.3-70b-versatile`)** as the LLM provider
-- Structured output types: `ResumeData` and `JDData` (defined in `schemas.py`)
-- **Why Groq:** fast inference speed matters for a bulk-processing pipeline where dozens of resumes may need extraction in one batch; using a hosted, fast-inference LLM keeps per-resume latency low without needing to self-host a model.
-- **Why structured extraction over keyword scraping:** resumes are free text with huge structural variance (headers, bullet styles, date formats). An LLM can normalize this into a consistent schema in one pass; regex/keyword scraping cannot generalize across resume formats.
-
-### Skill Normalization Layer ✅
-A dedicated module (`skill_aliases.py`) that canonicalizes skill strings before any comparison happens.
-- **Alias table:** hand-curated, deterministic mappings for known synonyms (e.g. `AWS` / `Amazon Web Services`, `K8s` / `Kubernetes`, `JS` / `JavaScript`)
-- **Parenthetical abbreviation extraction:** a general regex-based fix for the very common resume pattern `"Full Term (ABBR)"` (e.g. `"Object-Oriented Programming (OOP)"` → also matchable as `"oop"`)
-- **Why deterministic, not fuzzy/LLM-based:** semantic or fuzzy matching belongs in Stage 4 (embeddings), which is designed to handle "close but not identical" similarity. Stage 3 is a hard knockout gate — its logic must stay fully deterministic and auditable.
-
-### Stage 3 — Hard Filter ✅
-A deterministic knockout gate that rejects clearly unqualified candidates before any expensive scoring happens.
-- **Checks:** minimum experience, must-have skills, must-have skill *groups* (OR-logic sets), required certifications, optional strict location matching
-- **Why hard-reject before scoring:** running semantic/LLM scoring (Stage 4) on every resume is comparatively expensive. Filtering out clear non-matches first saves cost and keeps the ranked output focused.
-
-### Stage 4A — Semantic Scoring ✅
-Embedding-based similarity scoring using local model.
-- **Model:** `sentence-transformers/all-MiniLM-L6-v2` (free, no API calls)
-- **Computes 9 component scores:** must_have_skills, good_to_have_skills, domain_knowledge, certifications, total_experience, role_match, project_relevance, semantic_boost, summary_score
-- **Why local embeddings:** no external API cost, deterministic, fast for bulk processing
-
-### Stage 4B — LLM Scoring ✅
-LLM-based section scoring with structured output.
-- **Temperature=0.0** for determinism
-- **Structured response schema:** `LLMScoringResponse` with 8 score fields
-- **Fallback:** neutral scores (0.5) on failure with error logging
-
-### Stage 5 — Ranker ✅
-Weighted ranking using README-specified formula.
-- **Scoring formula:**
-  ```
-  final_score = (
-    0.40 × must_have_skills +
-    0.10 × good_to_have_skills +
-    0.10 × domain_knowledge +
-    0.15 × total_experience +
-    0.05 × role_match +
-    0.08 × semantic_boost +
-    0.05 × certifications +
-    0.05 × project_relevance +
-    0.02 × summary_score
-  )
-  ```
-- **Deterministic tiebreaker:** higher must_have_skills score wins
-- **Returns:** detailed `section_scores` breakdown for transparency
-
-### Stage 6 — Summariser ✅
-Grounded LLM-generated recruiter summaries.
-- **Inputs:** ResumeData, JDData, RankedCandidate (not free-form LLM invention)
-- **Output:** strengths, gaps, recommendation
-- **Grounding constraint:** Every claim traceable to structured data
-
-### Pipeline Orchestration ✅
-`pipeline.py` wires all stages into one callable function.
-- **Input:** list of (resume_bytes, filename) + (jd_bytes, filename)
-- **Output:** `PipelineResult` with ranked_candidates, rejected_candidates
-- **API:** `POST /pipeline/run` endpoint in `main.py`
-- **Error isolation:** one bad resume doesn't crash the batch
-
----
-
-## 3. Tech Stack Summary
-
-| Component | Choice | Why |
+| Method | Path | Purpose |
 |---|---|---|
-| PDF parsing | PyMuPDF + OCR fallback | Handles both text-based and scanned PDFs |
-| DOCX parsing | python-docx | Standard, reliable `.docx` extraction |
-| LLM extraction | Groq / `llama-3.3-70b-versatile` | Fast inference for bulk processing |
-| Data validation | Pydantic v2 schemas | Enforces consistent structured shape |
-| Semantic scoring | `sentence-transformers/all-MiniLM-L6-v2` | Free, local, no API limits |
-| Vector store | ChromaDB | Embedded, zero-infra |
-| Logging | `loguru` | Structured, readable pipeline logs |
-| API layer | FastAPI | Async-friendly, auto-generated docs |
+| GET | `/health` | Service health check |
+| POST | `/candidate-ranking` | Run the full ranking pipeline for one JD and many resumes |
+| GET | `/candidate-ranking/{session_id}` | Retrieve a previously saved pipeline result |
+| GET | `/candidate-ranking/{session_id}/candidate/{resume_id}` | Retrieve detailed candidate data from a saved session |
+| POST | `/pipeline/run` | Deprecated compatibility endpoint; prefer `/candidate-ranking` |
 
----
+Removed from the public API:
 
-## 4. API Endpoints
+```text
+/resume/extract
+/resume/extract-text
+/jd/extract
+/jd/extract-text
+/companies/{company}/sessions
+/sessions/{session_id}/candidates
+/resumes/{resume_id}
+```
 
-### POST /pipeline/run
-Process multiple resumes against a job description.
+Those stages still exist internally. They are no longer exposed as recruiter-facing endpoints.
 
-**Request (multipart/form-data):**
-- `resumes`: one or more PDF/DOCX files
-- `jd`: single PDF/DOCX job description
+## Architecture Flow
 
-**Response:**
+```text
+POST /candidate-ranking
+        |
+        v
+CandidateRankingService
+        |
+        v
+Pipeline Orchestrator
+        |
+        v
+Stage 1: Parse PDF/DOCX
+        |
+        v
+Text Cleaner: remove Outlook/email boilerplate
+        |
+        v
+Stage 2: LLM Extraction
+        |-- JDData
+        |-- ResumeData[]
+        |
+        v
+Stage 3: Hard Filter
+        |
+        |-- rejected candidates -> rejection summaries
+        |
+        v
+Stage 4A: Semantic Scoring
+        |
+        v
+Stage 4B: LLM Scoring
+        |
+        v
+Stage 5: Weighted Ranking
+        |
+        v
+Stage 6: Candidate Summaries
+        |
+        v
+Stage 7: Knowledge Briefs for top 3
+        |
+        v
+Persistence
+        |
+        v
+PipelineResult
+```
+
+## Main Modules
+
+| Area | File |
+|---|---|
+| FastAPI app and routes | `app/api/main.py` |
+| Business service layer | `app/services/candidate_ranking.py` |
+| End-to-end orchestration | `app/services/pipeline.py` |
+| PDF/DOCX/text parsing | `app/services/parser.py` |
+| Email/PDF boilerplate cleanup | `app/services/text_cleaner.py` |
+| LLM extraction | `app/services/extractor.py` |
+| Deterministic hard filter | `app/services/hard_filter.py` |
+| Local embedding scorer | `app/services/scorer_semantic.py` |
+| LLM section scorer | `app/services/scorer_llm.py` |
+| Weighted ranking | `app/services/ranker.py` |
+| Candidate/rejection summaries | `app/services/summariser.py` |
+| Knowledge briefs | `app/services/knowledge_brief.py` |
+| Persistence repository | `app/services/session_repo.py` |
+| SQLModel tables | `app/models/db_models.py` |
+| Extraction schemas | `app/models/schemas.py` |
+| Pipeline response schemas | `app/models/results.py` |
+| LLM providers | `app/llm/` |
+
+## Stage-by-Stage Details
+
+### 1. Upload and Request Validation
+
+Endpoint:
+
+```http
+POST /candidate-ranking
+```
+
+Request type:
+
+```text
+multipart/form-data
+```
+
+Fields:
+
+```text
+jd: one PDF or DOCX
+resumes: one or more PDF/DOCX files
+```
+
+`CandidateRankingService` validates file extensions, reads upload bytes, checks max file size, and passes file sources into the pipeline:
+
+```python
+jd_source = (jd_bytes, jd_filename)
+resume_sources = [(resume_bytes, resume_filename), ...]
+```
+
+### 2. Stage 1: Document Parsing
+
+Parser:
+
+```python
+parse_document(source, filename)
+```
+
+Supported formats:
+
+```text
+.pdf
+.docx
+.doc
+.txt
+.md
+```
+
+PDF flow:
+
+```text
+PyMuPDF text extraction
+OCR fallback with pytesseract if extracted text is suspiciously short
+```
+
+Output:
+
+```python
+raw_text: str
+```
+
+LLM calls: `0`
+
+### 3. Text Cleaner
+
+Cleaner:
+
+```python
+clean_document_text(raw_text)
+```
+
+This runs immediately after parsing and before LLM extraction.
+
+It removes common email/PDF transport noise:
+
+```text
+Outlook
+EXTERNAL warnings
+From / Sent / To / Cc / Bcc / Subject / Date headers
+Original Message blocks
+Forwarded Message blocks
+quoted reply lines
+email-only lines
+common confidentiality disclaimers
+extra blank lines
+```
+
+Output:
+
+```python
+cleaned_text: str
+```
+
+The pipeline logs cleanup when text length changes:
+
+```text
+Cleaned email/PDF boilerplate from 'file.pdf' | chars 12000 -> 7800
+```
+
+LLM calls: `0`
+
+### 4. Stage 2: LLM Extraction
+
+Extraction uses the active provider from `.env`:
+
+```env
+ACTIVE_LLM=groq
+GROQ_MODEL=llama-3.3-70b-versatile
+```
+
+Provider selection is centralized in:
+
+```python
+app/llm/factory.py
+```
+
+Groq structured completion is implemented in:
+
+```python
+app/llm/groq_provider.py
+```
+
+#### JD Extraction
+
+Function:
+
+```python
+extract_jd(cleaned_jd_text)
+```
+
+Output model:
+
+```python
+JDData
+```
+
+Important fields:
+
+```text
+job_title
+company
+location
+remote_policy
+min_experience_months
+must_have_skills
+must_have_skill_groups
+required_certifications
+required_education
+nice_to_have_skills
+preferred_experience_months
+responsibilities
+domain
+normalised_must_have_skills
+```
+
+LLM calls:
+
+```text
+1 per uploaded JD
+```
+
+Current output token budget:
+
+```python
+max_tokens=2500
+```
+
+#### Resume Extraction
+
+Function:
+
+```python
+extract_resume(cleaned_resume_text)
+```
+
+Output model:
+
+```python
+ResumeData
+```
+
+Important fields:
+
+```text
+resume_id
+candidate_name
+email
+phone
+location
+total_experience_months
+skills
+programming_languages
+frameworks_and_tools
+work_experience
+education
+projects
+certifications
+summary
+normalised_skills
+```
+
+LLM calls:
+
+```text
+1 per uploaded resume
+```
+
+Current output token budget:
+
+```python
+max_tokens=3500
+```
+
+Resume extraction retries up to 3 times if the call fails or the extracted result looks suspiciously incomplete.
+
+### 5. Stage 3: Hard Filter
+
+Function:
+
+```python
+run_hard_filter_bulk(extracted_resumes, jd)
+```
+
+Input:
+
+```python
+list[ResumeData]
+JDData
+```
+
+Checks:
+
+```text
+minimum experience
+must-have skills
+must-have skill groups, meaning one-of-many alternatives
+required certifications
+strict location matching only if location_strict=True
+education presence is informational only
+```
+
+Output:
+
+```python
+passed_resumes: list[ResumeData]
+filter_results: list[FilterResult]
+```
+
+`FilterResult` fields:
+
+```text
+resume_id
+candidate_name
+passed
+reject_reasons
+rejection_summary
+is_close_miss
+checks
+```
+
+LLM calls for hard filter logic: `0`
+
+### 6. Rejection Summaries
+
+Rejected candidates with valid extracted resume data are passed to:
+
+```python
+summarise_rejection(resume, jd, reject_reasons)
+```
+
+Output added to each rejected `FilterResult`:
+
+```text
+rejection_summary
+is_close_miss
+```
+
+LLM calls:
+
+```text
+1 per hard-filter rejected candidate
+```
+
+Parsing/extraction failures do not get LLM rejection summaries because there is no reliable structured resume to summarize.
+
+### 7. Stage 4A: Semantic Scoring
+
+Function:
+
+```python
+score_candidate_semantic(resume, jd)
+```
+
+Runs for candidates who passed the hard filter.
+
+Output:
+
+```python
+CandidateScores(method="semantic")
+```
+
+Section scores:
+
+```text
+must_have_skills
+good_to_have_skills
+domain_knowledge
+certifications
+total_experience
+role_match
+project_relevance
+semantic_boost
+summary_score
+```
+
+LLM calls: `0`
+
+Embedding model:
+
+```text
+sentence-transformers/all-MiniLM-L6-v2
+```
+
+This runs locally and does not use Groq tokens.
+
+### 8. Stage 4B: LLM Scoring
+
+Function:
+
+```python
+score_candidate_llm(resume, jd)
+```
+
+Runs only when:
+
+```env
+SIMILARITY_MODE=llm
+```
+
+or:
+
+```env
+SIMILARITY_MODE=both
+```
+
+Default:
+
+```env
+SIMILARITY_MODE=both
+```
+
+Output:
+
+```python
+CandidateScores(method="llm")
+```
+
+LLM scoring fields:
+
+```text
+must_have_skills_score
+good_to_have_skills_score
+domain_knowledge_score
+certifications_score
+total_experience_score
+role_match_score
+project_relevance_score
+summary_score
+skills_reasoning
+experience_reasoning
+```
+
+LLM calls:
+
+```text
+1 per passed candidate
+```
+
+Current output token budget:
+
+```python
+default max_tokens=4096
+```
+
+If LLM scoring fails, the code returns a 0.0 fallback score for that candidate's LLM scoring path and logs the failure.
+
+### 9. Stage 5: Weighted Ranking
+
+Function:
+
+```python
+rank_candidates(passed_resumes, semantic_scores, llm_scores)
+```
+
+Weights are loaded from:
+
+```text
+weights.json
+```
+
+Current weights:
+
+```text
+must_have_skills: 0.40
+good_to_have_skills: 0.10
+domain_knowledge: 0.10
+certifications: 0.05
+total_experience: 0.15
+role_match: 0.05
+semantic_similarity_boost: 0.08
+project_relevance: 0.05
+summary_score: 0.02
+blend_ratio: 0.5
+```
+
+Formula:
+
+```text
+final_score =
+  0.40 * must_have_skills
++ 0.10 * good_to_have_skills
++ 0.10 * domain_knowledge
++ 0.05 * certifications
++ 0.15 * total_experience
++ 0.05 * role_match
++ 0.08 * semantic_boost
++ 0.05 * project_relevance
++ 0.02 * summary_score
+```
+
+When `SIMILARITY_MODE=both`, section scores are blended:
+
+```text
+final_section_score = 0.5 * llm_score + 0.5 * semantic_score
+```
+
+Output:
+
+```python
+list[RankedCandidate]
+```
+
+Fields:
+
+```text
+rank
+resume_id
+candidate_name
+overall_score
+section_scores
+weights_used
+fit_summary
+```
+
+LLM calls: `0`
+
+### 10. Stage 6: Candidate Summaries
+
+Function:
+
+```python
+summarise_candidate(resume, jd, ranked)
+```
+
+Runs for every ranked candidate.
+
+Output:
+
+```python
+CandidateSummary
+```
+
+Fields:
+
+```text
+resume_id
+candidate_name
+strengths
+gaps
+recommendation
+agency_notes
+```
+
+The candidate's ranking object is then enriched:
+
+```python
+ranked.fit_summary = summary.recommendation
+```
+
+LLM calls:
+
+```text
+1 per ranked candidate
+```
+
+Current output token budget:
+
+```python
+default max_tokens=4096
+```
+
+### 11. Stage 7: Knowledge Briefs
+
+Function:
+
+```python
+generate_briefs_bulk(passed_resumes, jd, ranked_candidates, top_n=3)
+```
+
+Runs only for top 3 ranked candidates.
+
+Output:
+
+```python
+KnowledgeBrief
+```
+
+Fields:
+
+```text
+resume_id
+candidate_name
+role_overview
+team_context
+career_summary
+key_achievements
+technical_strengths
+alignment_highlights
+experience_relevance
+areas_to_probe
+suggested_talking_points
+years_of_experience
+current_or_last_role
+education_highlight
+certifications
+location
+```
+
+LLM calls:
+
+```text
+1 per top ranked candidate, maximum 3
+```
+
+Current output token budget:
+
+```python
+default max_tokens=4096
+```
+
+### 12. Persistence
+
+Function:
+
+```python
+save_full_session()
+```
+
+Runs after the pipeline has completed.
+
+Tables:
+
+```text
+Session
+JobDescriptionRecord
+ResumeRecord
+FilterResultRecord
+CandidateScoreRecord
+RankedCandidateRecord
+CandidateSummaryRecord
+KnowledgeBriefRecord
+```
+
+If `DATABASE_URL` is not configured, the pipeline still returns results but does not save session history.
+
+Retrieval:
+
+```http
+GET /candidate-ranking/{session_id}
+GET /candidate-ranking/{session_id}/candidate/{resume_id}
+```
+
+These reconstruct public response models from saved records.
+
+## Final Response Contract
+
+`POST /candidate-ranking` returns:
+
+```python
+PipelineResult
+```
+
+Example:
+
 ```json
 {
-  "jd_title": "Software Engineer – Full Stack Developer (MERN)",
+  "jd_title": "Senior Accountant",
   "total_resumes_processed": 3,
   "total_passed_filter": 2,
   "total_rejected": 1,
+  "rejected_candidates": [
+    {
+      "resume_id": "uuid",
+      "candidate_name": "Candidate Name",
+      "passed": false,
+      "reject_reasons": ["Missing required skills: Excel"],
+      "rejection_summary": "Candidate was rejected because...",
+      "is_close_miss": true,
+      "checks": {
+        "min_experience": true,
+        "must_have_skills": false
+      }
+    }
+  ],
   "ranked_candidates": [
     {
       "rank": 1,
-      "candidate_name": "Mohit Singh",
-      "overall_score": 0.6559,
+      "resume_id": "uuid",
+      "candidate_name": "Candidate Name",
+      "overall_score": 0.82,
       "section_scores": {
-        "must_have_skills": 0.75,
-        "good_to_have_skills": 0.45,
-        "domain_knowledge": 0.58,
-        ...
+        "must_have_skills": 1.0,
+        "good_to_have_skills": 0.7,
+        "domain_knowledge": 0.8,
+        "certifications": 1.0,
+        "total_experience": 0.9,
+        "role_match": 0.75,
+        "semantic_boost": 0.8,
+        "project_relevance": 0.5,
+        "summary_score": 0.7
       },
-      "fit_summary": "Based on the overall score of 0.66..."
+      "weights_used": {
+        "must_have_skills": 0.4,
+        "good_to_have_skills": 0.1,
+        "domain_knowledge": 0.1,
+        "total_experience": 0.15,
+        "role_match": 0.05,
+        "semantic_similarity_boost": 0.08,
+        "certifications": 0.05,
+        "project_relevance": 0.05,
+        "summary_score": 0.02,
+        "blend_ratio": 0.5
+      },
+      "fit_summary": "Recommended for recruiter review..."
     }
   ],
-  "rejected_candidates": [
-    {
-      "candidate_name": "resume2.pdf",
-      "passed": false,
-      "reject_reasons": ["Missing required skills: python, react"]
-    }
-  ]
+  "knowledge_briefs": [],
+  "similarity_mode": "both",
+  "session_id": "uuid"
 }
 ```
 
----
+## LLM Call Count
 
-## 5. What's Left to Build
+Let:
 
-| Component | Status | Priority |
-|-----------|--------|----------|
-| DB Persistence wiring | Schema ready in `db_models.py`, needs connection | Medium |
-| Session-oriented API (`/sessions`) | Not started | Medium |
-| Background job processing | Not started | Low (for large batches) |
-| Knowledge Brief Engine | Not started | Future enhancement |
-| Q&A Generation Engine | Not started | Future enhancement |
-| Frontend | Deferred by design | Future |
-
----
-
-## 6. Testing
-
-### Automated Tests
-- `tests/test_stages_4_5_6.py` — 17 tests for scoring, ranking, summary stages
-- `scripts/test_stage12.py` — Stage 1 & 2 parsing/extraction
-- `scripts/test_stage3.py` — Hard filter tests
-- `scripts/test_scoring.py` — Full pipeline smoke test
-
-### Run Tests
-```bash
-python -m pytest tests/test_stages_4_5_6.py -v
+```text
+N = uploaded resumes
+E = successfully extracted resumes
+P = candidates that passed the hard filter
+R = extracted candidates rejected by hard filter
+K = min(3, P)
 ```
 
----
+With default:
 
-## 7. Design Principles
+```env
+SIMILARITY_MODE=both
+```
 
-- **Backend-first, frontend deferred** — validate the pipeline logic before UI
-- **Each stage owns a single transformation** with consistent output shapes
-- **Deterministic gates stay deterministic** — Stage 3 uses exact matching only
-- **Test against real data** — skill-normalization bug caught via real JD/resume pair
-- **Judgment calls documented** — policy decisions explicitly commented
+Base LLM calls:
+
+```text
+1 JD extraction
++ N resume extractions
++ R rejection summaries
++ P LLM scoring calls
++ P candidate summaries
++ K knowledge briefs
+```
+
+Formula:
+
+```text
+total_llm_calls = 1 + N + R + P + P + K
+total_llm_calls = 1 + N + R + 2P + K
+```
+
+Example where 3 resumes all pass:
+
+```text
+N=3, R=0, P=3, K=3
+total = 1 + 3 + 0 + 6 + 3 = 13 LLM calls
+```
+
+Example where 3 resumes are uploaded, 2 pass and 1 is rejected:
+
+```text
+N=3, R=1, P=2, K=2
+total = 1 + 3 + 1 + 4 + 2 = 11 LLM calls
+```
+
+Retries can increase actual calls.
+
+## Token Usage
+
+The application does not currently calculate exact token usage before each request. Approximate token usage is:
+
+```text
+prompt_tokens ~= characters / 4
+request_tokens ~= prompt_tokens + max_tokens
+```
+
+Current output token reservations:
+
+| Stage | LLM calls | max_tokens |
+|---|---:|---:|
+| JD extraction | 1 per JD | 2500 |
+| Resume extraction | 1 per resume | 3500 |
+| LLM scoring | 1 per passed candidate | 4096 |
+| Rejection summary | 1 per hard-filter reject | 4096 |
+| Candidate summary | 1 per ranked candidate | 4096 |
+| Knowledge brief | 1 per top candidate, max 3 | 4096 |
+
+Groq calculates limits roughly against:
+
+```text
+system prompt + user prompt + reserved output tokens
+```
+
+Common errors:
+
+```text
+413 Request too large
+```
+
+The single request is too large for the current Groq TPM tier.
+
+```text
+429 Rate limit reached
+```
+
+The rolling tokens-per-minute window is already partially used. The Groq provider now reads messages like `try again in 32.79s`, waits, and retries.
+
+## Async and Rate Limit Behavior
+
+`POST /candidate-ranking` uses async orchestration.
+
+Resume parsing can run concurrently, but LLM calls are protected by:
+
+```python
+asyncio.Semaphore(1)
+```
+
+This means Groq-backed LLM calls run one at a time to reduce TPM failures.
+
+Local semantic scoring can still run concurrently because it uses local embeddings, not Groq.
+
+## Setup
+
+### 1. Clone
+
+```bash
+git clone <your-repo-url>
+cd Recruitment-platform
+```
+
+### 2. Create Virtual Environment
+
+Windows PowerShell:
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+```
+
+macOS/Linux:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 3. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Configure Environment
+
+Create `.env` from `.env.example`:
+
+```bash
+cp .env.example .env
+```
+
+On Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Minimum Groq setup:
+
+```env
+ACTIVE_LLM=groq
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.3-70b-versatile
+SIMILARITY_MODE=both
+EMBEDDING_PROVIDER=local
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+LOG_LEVEL=INFO
+MAX_RESUME_SIZE_MB=10
+```
+
+Optional database setup:
+
+```env
+DATABASE_URL=postgresql://user:password@host:5432/dbname
+```
+
+If no `DATABASE_URL` is set, processing still works, but retrieval by `session_id` will not work because results are not saved.
+
+### 5. Initialize Database
+
+Only needed if using persistence:
+
+```bash
+python -m app.core.database
+```
+
+### 6. Run FastAPI
+
+```bash
+uvicorn app.api.main:app --reload
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### 7. Run Candidate Ranking
+
+Use Swagger UI:
+
+1. Open `/docs`
+2. Expand `POST /candidate-ranking`
+3. Upload one JD PDF/DOCX
+4. Upload one or more resume PDF/DOCX files
+5. Execute
+
+Or use curl:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/candidate-ranking" \
+  -F "jd=@JD.pdf" \
+  -F "resumes=@Resume1.pdf" \
+  -F "resumes=@Resume2.pdf"
+```
+
+Windows PowerShell alternative:
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/candidate-ranking" `
+  -F "jd=@JD.pdf" `
+  -F "resumes=@Resume1.pdf" `
+  -F "resumes=@Resume2.pdf"
+```
+
+## Running Tests
+
+Run the focused text cleaner test:
+
+```bash
+python -m pytest tests/test_text_cleaner.py
+```
+
+Run all tests:
+
+```bash
+python -m pytest
+```
+
+Some older tests may need updates if they assert old stage internals or old score shapes.
+
+## Troubleshooting
+
+### `/` returns 404
+
+This is normal. Use:
+
+```text
+/docs
+/health
+/candidate-ranking
+```
+
+### Swagger still shows old endpoints
+
+Restart Uvicorn completely. With `--reload`, stale child processes can sometimes hold the old app briefly.
+
+### Groq 413: Request too large
+
+Cause:
+
+```text
+prompt tokens + max_tokens > Groq TPM tier limit
+```
+
+Fixes:
+
+```text
+Use cleaner JD/resume files
+Remove email chains and signatures
+Reduce max_tokens
+Use a higher Groq tier
+Use another provider with larger limits
+```
+
+### Groq 429: Rate limit reached
+
+Cause:
+
+```text
+Too many tokens used in the rolling minute window
+```
+
+Current mitigation:
+
+```text
+LLM calls are throttled one at a time
+Groq provider waits and retries when Groq gives "try again in Xs"
+```
+
+### `tenacity.RetryError`
+
+This means a retried LLM operation failed after all retry attempts. Look above the `RetryError` in logs for the real cause, usually a Groq `413`, `429`, invalid JSON, or provider failure.
+
+### OCR does not work
+
+For scanned PDFs, `pytesseract` requires the Tesseract executable to be installed on the machine, not just the Python package.
+
+## Development Notes
+
+Important constraints:
+
+```text
+Do not change ranking formulas casually
+Do not expose internal stage endpoints
+Keep PipelineResult stable
+Keep hard filter deterministic
+Keep LLM provider access centralized through app/llm/factory.py
+```
+
+Recommended API surface for other services:
+
+```text
+POST /candidate-ranking
+GET /candidate-ranking/{session_id}
+GET /candidate-ranking/{session_id}/candidate/{resume_id}
+```
+
