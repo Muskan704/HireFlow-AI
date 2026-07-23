@@ -132,14 +132,24 @@ multipart/form-data
 Fields:
 
 ```text
-jd: one PDF or DOCX
+jd: optional JD PDF or DOCX
+jd_text: optional plain-text JD
 resumes: one or more PDF/DOCX files
 ```
 
-`CandidateRankingService` validates file extensions, reads upload bytes, checks max file size, and passes file sources into the pipeline:
+Provide exactly one JD source:
+
+```text
+Use jd for file upload, or jd_text for pasted/raw JD text.
+Do not send both jd and jd_text in the same request.
+```
+
+`CandidateRankingService` validates file extensions, reads upload bytes, checks max file size, and passes file sources into the pipeline. For pasted JDs, it converts `jd_text` into an internal `.txt` source so the same pipeline path is reused:
 
 ```python
 jd_source = (jd_bytes, jd_filename)
+# or
+jd_source = (jd_text.encode("utf-8"), "job_description.txt")
 resume_sources = [(resume_bytes, resume_filename), ...]
 ```
 
@@ -970,7 +980,7 @@ Use Swagger UI:
 
 1. Open `/docs`
 2. Expand `POST /candidate-ranking`
-3. Upload one JD PDF/DOCX
+3. Upload one JD PDF/DOCX or paste JD content into `jd_text`
 4. Upload one or more resume PDF/DOCX files
 5. Execute
 
@@ -983,11 +993,29 @@ curl -X POST "http://127.0.0.1:8000/candidate-ranking" \
   -F "resumes=@Resume2.pdf"
 ```
 
+With pasted JD text:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/candidate-ranking" \
+  -F "jd_text=Senior Accountant role requiring month-end close, reconciliations, Excel, and ERP experience." \
+  -F "resumes=@Resume1.pdf" \
+  -F "resumes=@Resume2.pdf"
+```
+
 Windows PowerShell alternative:
 
 ```powershell
 curl.exe -X POST "http://127.0.0.1:8000/candidate-ranking" `
   -F "jd=@JD.pdf" `
+  -F "resumes=@Resume1.pdf" `
+  -F "resumes=@Resume2.pdf"
+```
+
+Windows PowerShell with pasted JD text:
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/candidate-ranking" `
+  -F "jd_text=Senior Accountant role requiring month-end close, reconciliations, Excel, and ERP experience." `
   -F "resumes=@Resume1.pdf" `
   -F "resumes=@Resume2.pdf"
 ```
@@ -1084,4 +1112,3 @@ POST /candidate-ranking
 GET /candidate-ranking/{session_id}
 GET /candidate-ranking/{session_id}/candidate/{resume_id}
 ```
-

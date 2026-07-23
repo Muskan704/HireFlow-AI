@@ -9,7 +9,9 @@ Public API surface:
 
 import sys
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from typing import Annotated
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -52,14 +54,34 @@ def health():
     tags=["Candidate Ranking"],
 )
 async def create_candidate_ranking(
-    jd: UploadFile = File(..., description="One job description file (PDF/DOCX)"),
-    resumes: list[UploadFile] = File(..., description="Multiple resume files (PDF/DOCX)"),
+    resumes: Annotated[
+        list[UploadFile],
+        File(
+            description="Multiple resume files (PDF/DOCX)",
+        ),
+    ],
+    jd: Annotated[
+        UploadFile,
+        File(
+            description="Optional job description file (PDF/DOCX). Use either jd or jd_text.",
+        ),
+    ] = None,
+    jd_text: Annotated[
+        str | None,
+        Form(
+            description="Optional raw job description text. Use either jd_text or jd.",
+        ),
+    ] = None,
 ):
     """
     Primary business endpoint for recruiters and consuming microservices.
     """
     try:
-        return await candidate_ranking_service.process(jd=jd, resumes=resumes)
+        return await candidate_ranking_service.process(
+            jd=jd,
+            jd_text=jd_text,
+            resumes=resumes,
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:

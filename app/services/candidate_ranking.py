@@ -9,6 +9,7 @@ extraction, filtering, scoring, ranking, summarisation, and brief generation.
 from __future__ import annotations
 
 import asyncio
+from typing import Optional
 
 from fastapi import UploadFile
 
@@ -24,13 +25,14 @@ class CandidateRankingService:
 
     async def process(
         self,
-        jd: UploadFile,
+        jd: Optional[UploadFile],
+        jd_text: Optional[str],
         resumes: list[UploadFile],
     ) -> PipelineResult:
         if not resumes:
             raise ValueError("At least one resume file is required.")
 
-        jd_source = await self._read_upload(jd, "Job description")
+        jd_source = await self._build_jd_source(jd=jd, jd_text=jd_text)
         resume_sources = await asyncio.gather(*[
             self._read_upload(resume, "Resume")
             for resume in resumes
@@ -42,6 +44,25 @@ class CandidateRankingService:
         )
         result.session_id = session_id or None
         return result
+
+    async def _build_jd_source(
+        self,
+        jd: Optional[UploadFile],
+        jd_text: Optional[str],
+    ) -> tuple[bytes, str]:
+        has_jd_file = jd is not None and bool(jd.filename)
+        has_jd_text = bool(jd_text and jd_text.strip())
+
+        if has_jd_file and has_jd_text:
+            raise ValueError("Provide either jd file or jd_text, not both.")
+
+        if has_jd_text:
+            return jd_text.strip().encode("utf-8"), "job_description.txt"
+
+        if has_jd_file and jd is not None:
+            return await self._read_upload(jd, "Job description")
+
+        raise ValueError("Either jd file or jd_text is required.")
 
     def get_result(self, session_id: str) -> PipelineResult:
         return get_pipeline_result(session_id)
