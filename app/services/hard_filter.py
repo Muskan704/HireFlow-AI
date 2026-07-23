@@ -27,6 +27,61 @@ from loguru import logger
 
 from app.models.schemas import ResumeData, JDData
 from app.models.results import FilterResult
+from app.services.skill_aliases import normalize_skill_list
+
+
+_CATEGORY_SKILL_MATCHES: dict[str, set[str]] = {
+    # A generic "vector database" requirement should be satisfied by concrete
+    # vector database/search tools, while a specific "Pinecone" requirement
+    # still requires Pinecone.
+    "vector database": {
+        "vector database",
+        "pinecone",
+        "weaviate",
+        "qdrant",
+        "faiss",
+        "milvus",
+        "pgvector",
+        "chroma",
+    },
+    # Recruiter JDs often say "LLMs" while resumes list concrete LLM work/tools.
+    "llm": {
+        "llm",
+        "rag",
+        "prompt engineering",
+        "fine-tuning",
+        "transformers",
+        "langchain",
+        "llamaindex",
+        "openai",
+        "gpt",
+        "llama",
+        "azure openai",
+    },
+    "rest api": {
+        "rest api",
+        "fastapi",
+        "django",
+        "flask",
+        "spring",
+        "express.js",
+        "nestjs",
+    },
+}
+
+
+def _candidate_has_required_skill(
+    required_skill: str,
+    candidate_skill_set: set[str],
+) -> bool:
+    if required_skill in candidate_skill_set:
+        return True
+
+    category_matches = _CATEGORY_SKILL_MATCHES.get(required_skill)
+    if category_matches:
+        return bool(category_matches & candidate_skill_set)
+
+    return False
 
 
 def run_hard_filter(resume: ResumeData, jd: JDData) -> FilterResult:
@@ -64,7 +119,7 @@ def run_hard_filter(resume: ResumeData, jd: JDData) -> FilterResult:
         candidate_skill_set = set(resume.normalised_skills)
         missing_skills = [
             skill for skill in jd.normalised_must_have_skills
-            if skill not in candidate_skill_set
+            if not _candidate_has_required_skill(skill, candidate_skill_set)
         ]
         skills_ok = len(missing_skills) == 0
         checks["must_have_skills"] = skills_ok
@@ -87,9 +142,10 @@ def run_hard_filter(resume: ResumeData, jd: JDData) -> FilterResult:
         failed_groups: list[list[str]] = []
 
         for group in jd.must_have_skill_groups:
-            normalised_group = [s.lower().strip() for s in group]
+            normalised_group = normalize_skill_list(group)
             group_satisfied = any(
-                skill in candidate_skill_set for skill in normalised_group
+                _candidate_has_required_skill(skill, candidate_skill_set)
+                for skill in normalised_group
             )
             if not group_satisfied:
                 failed_groups.append(group)

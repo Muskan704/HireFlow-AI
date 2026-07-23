@@ -3,12 +3,14 @@ Stage 2 — LLM Extraction
 Converts raw document text into validated Pydantic v2 objects using Instructor.
 """
 from __future__ import annotations
+import re
 from app.llm.factory import get_llm
 from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_result
 
 from app.core.config import get_settings
 from app.models.schemas import ResumeData, JDData
+from app.services.skill_aliases import normalize_skill_list
 
 settings = get_settings()
 
@@ -16,7 +18,10 @@ RESUME_SYSTEM_PROMPT = """
 You are an expert recruitment analyst. Extract structured information from the
 resume text provided. Follow these rules precisely:
 
-1. Compute total_experience_months by summing all individual work durations.
+1. Compute total_experience_months from the strongest evidence in the resume.
+   Prefer the explicit total stated in the professional summary/headline when
+   present, e.g. "3+ years of hands-on experience" = 36 months. If no explicit
+   total is stated, sum all individual work durations.
    Example: 30 months at Company A + 18 months at Company B = 48 months total.
 
 2. Normalise ALL skill names to their full common form:
@@ -66,6 +71,45 @@ def _resume_extraction_looks_incomplete(result: ResumeData) -> bool:
     return len(result.skills) < 5 and len(result.work_experience) < 2
 
 
+def _extract_explicit_experience_months(raw_text: str) -> int | None:
+    """
+    Extract explicit total-experience claims from summary/headline text.
+    This is a floor, not a replacement for detailed work-history parsing.
+    """
+    patterns = [
+        r"(?P<num>\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)\s+(?:of\s+)?(?:hands-on\s+)?experience",
+        r"(?:experience\s+of|total\s+experience\s*:?)\s*(?P<num>\d+(?:\.\d+)?)\s*\+?\s*(?:years?|yrs?)",
+        r"(?P<num>\d+)\s*\+?\s*(?:months?|mos?)\s+(?:of\s+)?(?:hands-on\s+)?experience",
+    ]
+
+    candidates: list[int] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, raw_text, flags=re.IGNORECASE):
+            number = float(match.group("num"))
+            if "month" in match.group(0).lower() or "mos" in match.group(0).lower():
+                candidates.append(int(number))
+            else:
+                candidates.append(int(number * 12))
+
+    return max(candidates) if candidates else None
+
+
+def _apply_explicit_experience_floor(result: ResumeData, raw_text: str) -> ResumeData:
+    explicit_months = _extract_explicit_experience_months(raw_text)
+    if explicit_months is None:
+        return result
+
+    extracted_months = result.total_experience_months or 0
+    if explicit_months > extracted_months:
+        logger.info(
+            "Resume experience adjusted from explicit summary | "
+            f"name={result.candidate_name!r} | {extracted_months}mo -> {explicit_months}mo"
+        )
+        result.total_experience_months = explicit_months
+
+    return result
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=2, max=10),
@@ -89,6 +133,7 @@ def extract_resume(raw_text: str) -> ResumeData:
     )
 
     result.raw_text_snippet = raw_text[:300]
+    result = _apply_explicit_experience_floor(result, raw_text)
 
     if _resume_extraction_looks_incomplete(result):
         logger.warning(
@@ -183,6 +228,21 @@ job description provided. Follow these rules precisely:
     must_have_skills for individually-required skills, AND
     must_have_skill_groups for "one of these" requirements, at the same time.
 
+    AI/ML requirement examples that MUST be treated as OR-groups when phrased
+    as alternatives or categories:
+      - "TensorFlow or PyTorch" / "TensorFlow/PyTorch" ->
+        must_have_skill_groups = [["TensorFlow", "PyTorch"]]
+      - "AWS/Azure/GCP", "cloud platform experience", or "one major cloud" ->
+        must_have_skill_groups = [["AWS", "Azure", "GCP"]]
+      - "REST/GraphQL APIs" ->
+        must_have_skill_groups = [["REST API", "GraphQL"]]
+      - "vector databases such as Pinecone, Weaviate, FAISS, ChromaDB" ->
+        must_have_skill_groups = [["Pinecone", "Weaviate", "FAISS", "Chroma"]]
+        unless the JD explicitly requires one named product.
+
+    Do not duplicate the same concept in different spellings. For example,
+    extract either "LLM" or "Large Language Models", not both.
+
 2. Convert experience to months:
    "3+ years" → 36,  "2-5 years" → 24 (use the minimum),  "5 years" → 60
 
@@ -193,6 +253,78 @@ job description provided. Follow these rules precisely:
 
 5. If a field is genuinely absent, return null or [] — do NOT hallucinate.
 """
+
+
+def _append_skill_group_once(groups: list[list[str]], group: list[str]) -> None:
+    target = set(normalize_skill_list(group))
+    for existing_group in groups:
+        if set(normalize_skill_list(existing_group)) == target:
+            return
+    groups.append(group)
+
+
+def _remove_skills_by_normalized_name(
+    skills: list[str],
+    names_to_remove: set[str],
+) -> list[str]:
+    return [
+        skill for skill in skills
+        if not (set(normalize_skill_list([skill])) & names_to_remove)
+    ]
+
+
+def _soften_jd_alternative_requirements(result: JDData, raw_text: str) -> JDData:
+    """
+    Correct common JD extraction mistakes that would otherwise make the hard
+    filter require every alternative technology at the same time.
+    """
+    raw_lower = raw_text.lower()
+    must_have_normalized = set(normalize_skill_list(result.must_have_skills))
+    original_must_have = list(result.must_have_skills)
+    original_groups = [list(group) for group in result.must_have_skill_groups]
+
+    cloud_skills = {"aws", "azure", "gcp"}
+    if len(must_have_normalized & cloud_skills) >= 2:
+        result.must_have_skills = _remove_skills_by_normalized_name(
+            result.must_have_skills,
+            cloud_skills,
+        )
+        _append_skill_group_once(result.must_have_skill_groups, ["AWS", "Azure", "GCP"])
+
+    api_skills = {"rest api", "graphql"}
+    if len(must_have_normalized & api_skills) >= 2:
+        result.must_have_skills = _remove_skills_by_normalized_name(
+            result.must_have_skills,
+            api_skills,
+        )
+        _append_skill_group_once(result.must_have_skill_groups, ["REST API", "GraphQL"])
+
+    ml_framework_skills = {"tensorflow", "pytorch"}
+    has_ml_framework_alternative = (
+        ("tensorflow" in raw_lower and "pytorch" in raw_lower)
+        or (
+            bool(must_have_normalized & ml_framework_skills)
+            and bool(set(normalize_skill_list(result.nice_to_have_skills)) & ml_framework_skills)
+        )
+    )
+    if has_ml_framework_alternative and (must_have_normalized & ml_framework_skills):
+        result.must_have_skills = _remove_skills_by_normalized_name(
+            result.must_have_skills,
+            ml_framework_skills,
+        )
+        _append_skill_group_once(result.must_have_skill_groups, ["TensorFlow", "PyTorch"])
+
+    if (
+        original_must_have != result.must_have_skills
+        or original_groups != result.must_have_skill_groups
+    ):
+        logger.info(
+            "JD requirements softened for hard filter | "
+            f"must_have: {original_must_have} -> {result.must_have_skills} | "
+            f"skill_groups: {original_groups} -> {result.must_have_skill_groups}"
+        )
+
+    return result
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
@@ -211,6 +343,7 @@ def extract_jd(raw_text: str) -> JDData:
     )
 
     result.raw_text_snippet = raw_text[:300]
+    result = _soften_jd_alternative_requirements(result, raw_text)
 
     logger.info(
         f"✓ JD extracted: title={result.job_title!r} | "

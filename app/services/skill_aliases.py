@@ -496,6 +496,8 @@ _SKILL_ALIAS_GROUPS: dict[str, set[str]] = {
     },
     "llm": {
         "llm", "llms", "large language model", "large language models",
+        "large language model llm", "large language models llms",
+        "large language models (llms)", "large language model (llm)",
     },
     "rag": {
         "rag", "retrieval augmented generation",
@@ -721,7 +723,8 @@ _SKILL_ALIAS_GROUPS: dict[str, set[str]] = {
         "nosql", "no sql",
     },
     "vector database": {
-        "vector database", "vector db", "vectordb",
+        "vector database", "vector databases", "vector db", "vector dbs",
+        "vectordb", "vectordbs",
     },
     "chroma": {
         "chroma", "chromadb", "chroma db",
@@ -766,6 +769,8 @@ _SKILL_ALIAS_GROUPS: dict[str, set[str]] = {
     "rest api": {
         "rest api", "rest apis", "restful api", "restful apis",
         "rest", "restful", "representational state transfer",
+        "rest/graphql api", "rest/graphql apis", "rest graphql api",
+        "rest graphql apis",
     },
     "graphql": {
         "graphql", "graph ql",
